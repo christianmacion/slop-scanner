@@ -252,13 +252,22 @@ def _blocks(lines):
         yield current, block
 
 
+_HYPHEN_END = re.compile(r"[^\W\d_]-\s*$")
+
+
 def _join(block):
-    """One string per paragraph, plus where each source line starts in it."""
-    starts, pos = [], 0
+    """One string per paragraph, plus where each source line starts in it.
+    A line ending in a hyphenated break ("cutting-" / "edge") is rejoined
+    without a space, as wrapped PDFs and editors split compounds there."""
+    text, starts = "", []
     for _, _, clean in block:
-        starts.append(pos)
-        pos += len(clean) + 1
-    return " ".join(clean for _, _, clean in block), starts
+        if _HYPHEN_END.search(text):
+            text, clean = text.rstrip(), clean.lstrip()
+        elif text:
+            text += " "
+        starts.append(len(text))
+        text += clean
+    return text, starts
 
 
 def _is_participle_opener(words):
