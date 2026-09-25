@@ -12,8 +12,10 @@ The text is read two ways, from one cleaned copy:
   * lexical view: every line of natural language (prose, headings, lists,
     quotes, table cells). Word and phrase rules match here, once per
     occurrence, across line wraps.
-  * rhythm view: running prose only, split into sentences inside each
-    paragraph. Density and sentence-shape rules measure here.
+  * rhythm view: paragraphs of running prose, split into sentences inside
+    each paragraph. Density and sentence-shape rules measure here. Labels
+    and captions (a line with no full stop) are left out, and so are
+    bullets, unless a bullet holds two or more sentences of its own.
 Neither view sees code, frontmatter, HTML tags, URLs or inline code, and the
 lexical view also skips double-quoted spans: writing about "delve" is not
 using it.
@@ -296,22 +298,22 @@ def analyze_text(raw):
     unsupported_script = (len(letters) - latin) >= 20 and latin < len(letters) - latin
 
     # ---- rhythm view -------------------------------------------------------
-    sents, emdash, bold, n_prose_words = [], 0, 0, 0
-    paragraphs = fragments = 0
+    sents, emdash, bold, n_prose_words, fragments = [], 0, 0, 0, 0
     for kind, block in blocks:
-        if kind != "prose":
+        if kind not in ("prose", "list"):
             continue
         text, _ = _join(block)
-        paragraphs += 1
-        fragments += not _TERMINAL.search(text.rstrip())
+        parts = [w for w in (_WORD.findall(p) for p in _SENT_END.split(text)) if len(w) >= 2]
+        if len(parts) < 2:
+            if kind == "list":
+                continue                          # a bullet, not a paragraph
+            if not _TERMINAL.search(text.rstrip()):
+                fragments += 1                    # a label or caption
+                continue
+        sents += parts
         emdash += text.count("—")
         bold += sum(len(_BOLD.findall(masked)) for _, masked, _ in block)
         n_prose_words += len(_WORD.findall(text))
-        for part in _SENT_END.split(text):
-            words = _WORD.findall(part)
-            if len(words) >= 2:
-                sents.append(words)
-    fragmentary = paragraphs >= 4 and fragments * 2 >= paragraphs
 
     per1k = (lambda c: round(c * 1000 / max(n_prose_words, RATE_FLOOR_WORDS), 1)
              if n_prose_words else 0)
@@ -332,8 +334,7 @@ def analyze_text(raw):
     participle = sum(1 for w in sents if _is_participle_opener(w))
     part_pct = round(participle * 100 / max(len(sents), RATE_FLOOR_SENTENCES), 1) if sents else 0
 
-    rhythm_ok = not fragmentary
-    variance_ok = rhythm_ok and len(lens) >= RATE_FLOOR_SENTENCES
+    variance_ok = len(lens) >= RATE_FLOOR_SENTENCES
 
     title = next((l for l in lines if re.match(r"^\s*#\s", l)), "")
     title_colon = bool(re.search(r":", title)) and bool(
@@ -352,10 +353,10 @@ def analyze_text(raw):
             notes.append(f"Short text ({n_prose_words} words of running prose). Rates are "
                          f"measured over at least {RATE_FLOOR_WORDS} words, so a single "
                          "em-dash or bold phrase can't decide the verdict.")
-        if fragmentary:
-            notes.append("Most paragraphs are fragments (slides, forms, lists), so "
-                         "sentence-rhythm rules were not scored.")
-        elif not variance_ok:
+        if fragments >= 3:
+            notes.append(f"{fragments} fragments (labels, captions, lines with no full "
+                         "stop) were left out of the sentence rules.")
+        if not variance_ok:
             notes.append(f"Only {len(lens)} sentences. Sentence-length variance needs "
                          f"{RATE_FLOOR_SENTENCES} and was not scored.")
 
@@ -369,7 +370,7 @@ def analyze_text(raw):
         intent=hits["intent"], finance=hits["finance"],
         reader=hits["reader"], residue=hits["residue"],
         title_colon=title_colon, title=title.strip(),
-        rhythm_ok=rhythm_ok, variance_ok=variance_ok, fragmentary=fragmentary,
+        variance_ok=variance_ok, fragments=fragments,
         unsupported_script=unsupported_script, notes=notes,
     )
 
@@ -383,7 +384,6 @@ def _status(value, warn, bad):
 
 
 def _rows(m):
-    rhythm = (lambda s: s if m['rhythm_ok'] else "n/a")
     cv_status = "FLAG" if (m['cv'] and m['cv'] < 0.4) else ("warn" if m['cv'] and m['cv'] < 0.5 else "ok")
     return [
         ("Em-dashes", f"{m['emdash']} ({m['emdash_per1k']}/1k)",
@@ -393,9 +393,9 @@ def _rows(m):
         ("Sentence variance", f"mean {m['mean_len']}w, CV {m['cv']}",
          cv_status if m['variance_ok'] else "n/a", "CV<0.4 = too uniform; human ~0.5–0.8"),
         ("Monotony run", f"{m['longest_run']} sentences",
-         rhythm(_status(m['longest_run'], 4, 6)), "consecutive sentences within 3 words"),
+         _status(m['longest_run'], 4, 6), "consecutive sentences within 3 words"),
         ("-ing openers", f"{m['participle']} ({m['part_pct']}%)",
-         rhythm(_status(m['part_pct'], 6, 10)), "'Leveraging the…' openers; human ~2–3%"),
+         _status(m['part_pct'], 6, 10), "'Leveraging the…' openers; human ~2–3%"),
         ("Bold emphasis", f"{m['bold']} ({m['bold_per1k']}/1k)",
          _status(m['bold_per1k'], 5, 10), "bolded punch-lines in prose; use sparingly"),
         ("Blocklist words", f"{len(m['blockw'])} hits",
@@ -421,9 +421,8 @@ def contributions(m):
          "Contrastive / False Reframe": len(m['contra']) * 4}
     if m['variance_ok']:
         c["Sentence variance"] = 12 if (m['cv'] and m['cv'] < 0.4) else 0
-    if m['rhythm_ok']:
-        c["Monotony run"] = min(STAT_CAP, max(0, m['longest_run'] - 3) * 3)
-        c["-ing openers"] = min(STAT_CAP, max(0, m['part_pct'] - 6) * 2)
+    c["Monotony run"] = min(STAT_CAP, max(0, m['longest_run'] - 3) * 3)
+    c["-ing openers"] = min(STAT_CAP, max(0, m['part_pct'] - 6) * 2)
     c["Bold emphasis"] = min(STAT_CAP, max(0, m['bold_per1k'] - 5) * 1.0)
     c["Blocklist words"] = len(m['blockw']) * 3
     c["Blocklist phrases"] = len(m['blockp']) * 4

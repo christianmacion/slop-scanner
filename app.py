@@ -13,6 +13,7 @@ locally with `streamlit run app.py`.
 
 import streamlit as st
 
+import readers
 from slop_engine import score_text
 from samples import SAMPLES
 
@@ -66,13 +67,34 @@ with left:
         placeholder="Paste a blog draft, article, or any prose here…",
         key=choice,  # reset the box when a sample is picked
     )
+    upload = st.file_uploader(
+        "…or upload a file",
+        type=list(readers.SUPPORTED),
+        help="PDF, PowerPoint, Word, Markdown or plain text. "
+             "Scanned PDFs are images of pages and have no text to read.",
+    )
     scan = st.button("Scan draft →", type="primary", use_container_width=True)
 
-if not (scan or text.strip()):
+if upload is not None:
+    try:
+        text = readers.read_file(upload, upload.name)
+    except ValueError as e:
+        st.error(f"Couldn't read **{upload.name}**: {e}")
+        st.stop()
+    except Exception:
+        st.error(f"Couldn't read **{upload.name}**. It may be damaged or password-protected.")
+        st.stop()
+    with left:
+        st.caption(f"Scoring **{upload.name}**. Remove the file to score the draft box instead.")
+        with st.expander("Extracted text"):
+            st.text_area("Extracted text", text, height=240, disabled=True,
+                         label_visibility="collapsed")
+
+elif not (scan or text.strip()):
     st.info("Load a sample on the left (try **Heavy slop** vs **Clean human draft**) or paste your own, then **Scan**.")
     st.stop()
 
-if not text.strip():
+if upload is None and not text.strip():
     st.warning("Nothing to scan — paste some text first.")
     st.stop()
 
