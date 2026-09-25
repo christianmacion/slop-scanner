@@ -5,5 +5,3 @@ __pycache__/
 .streamlit/secrets.toml
 venv/
 .env
-.chroma/
-quantlib/_cache/

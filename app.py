@@ -73,7 +73,7 @@ with left:
         help="PDF, PowerPoint, Word, Markdown or plain text. "
              "Scanned PDFs are images of pages and have no text to read.",
     )
-    scan = st.button("Scan draft →", type="primary", use_container_width=True)
+    scan = st.button("Scan draft →", type="primary", width="stretch")
 
 if upload is not None:
     try:
@@ -91,7 +91,8 @@ if upload is not None:
                          label_visibility="collapsed")
 
 elif not (scan or text.strip()):
-    st.info("Load a sample on the left (try **Heavy slop** vs **Clean human draft**) or paste your own, then **Scan**.")
+    st.info("Load a sample on the left (try **Heavy slop** vs **Clean human draft**), "
+            "paste your own draft, or upload a file.")
     st.stop()
 
 if upload is None and not text.strip():
@@ -133,7 +134,7 @@ table = [
      "Status": STATUS_BADGE[r["status"]], "What it catches": r["note"]}
     for r in result["rows"]
 ]
-st.dataframe(table, use_container_width=True, hide_index=True)
+st.dataframe(table, hide_index=True)
 
 # ----------------------------------------------------------------------------
 # Flagged spans
