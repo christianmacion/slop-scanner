@@ -8,10 +8,25 @@ Medium content pipeline) so it takes a STRING and returns STRUCTURED results
 No single metric proves AI authorship; what matters is DENSITY and CO-OCCURRENCE.
 Treat flags as "go look," not "delete on sight." The human reader is the judge.
 
+The text is read two ways, from one cleaned copy:
+  * lexical view: every line of natural language (prose, headings, lists,
+    quotes, table cells). Word and phrase rules match here, once per
+    occurrence, across line wraps.
+  * rhythm view: running prose only, split into sentences inside each
+    paragraph. Density and sentence-shape rules measure here.
+Neither view sees code, frontmatter, HTML tags, URLs or inline code, and the
+lexical view also skips double-quoted spans: writing about "delve" is not
+using it.
+
 Public API:
     score_text(text: str) -> dict   # metrics, per-rule rows, SLOP INDEX, verdict, flagged spans
+
+When the text cannot be judged (no readable text, or not in a Latin script)
+result["scored"] is False and result["slop_index"] is None, so a gate such as
+`r["slop_index"] < 15` fails loudly instead of passing text nobody read.
 """
 
+import bisect
 import re
 import statistics
 
@@ -19,14 +34,23 @@ import statistics
 # Word / phrase lists (from the AI-tells guardrail checklist)
 # ---------------------------------------------------------------------------
 BLOCKLIST = [
-    "delve", "navigate", "leverage", "underscore", "showcase", "foster",
-    "harness", "unlock", "elevate", "embark", "unleash", "spearhead",
+    "delve", "navigate", "underscore", "showcase", "foster",
+    "unlock", "elevate", "embark", "unleash", "spearhead",
     "illuminate", "resonate", "streamline",
     "robust", "comprehensive", "nuanced", "pivotal", "holistic", "seamless",
     "transformative", "intricate", "multifaceted", "ever-evolving",
     "cutting-edge", "game-changing", "unparalleled",
     "tapestry", "testament", "realm", "landscape", "ecosystem", "paradigm",
     "synergy", "confluence", "trajectory",
+]
+
+# Ordinary nouns in engineering and finance ("eval harness", "2x leverage",
+# "a leveraged ETF") that only read as slop as verbs taking an object:
+# "harnessing the power", "leverage this concept".
+_DET = r"(?:the|a|an|this|that|these|those|its|their|our|your|his|her|my)"
+VERB_ONLY = [
+    (r"\bharnessing\b|\bharness(?:es|ed)?\s+" + _DET + r"\b", "harness"),
+    (r"\bleveraging\b|\bleverag(?:e|es|ed)\s+" + _DET + r"\b", "leverage"),
 ]
 
 BLOCK_PHRASES = [
@@ -79,67 +103,218 @@ ING_STOP = {
     "willing", "ongoing",
 }
 
+# A participial opener takes an object ("Leveraging THIS concept…"); a noun
+# adjunct does not ("Trading systems…"). Only the first is the tell.
+DETERMINERS = {
+    "the", "a", "an", "this", "that", "these", "those", "your", "our", "its",
+    "their", "his", "her", "my", "each", "every", "such", "another", "any",
+}
+
+# Rates are measured over at least this much text. Without a floor, one
+# em-dash in twelve words is 83 per thousand and a one-sentence draft opening
+# with "Leveraging the…" is 100% participle openers. With it, a single
+# occurrence in a short text barely registers but a real pile still does.
+RATE_FLOOR_WORDS = 150
+RATE_FLOOR_SENTENCES = 10
+
+# Rate and shape measurements are noisy, so none of them may carry a verdict
+# on its own. Lexical hits are concrete, cited spans and stay uncapped.
+STAT_CAP = 30
+
+
+def _phrases(items):
+    return [(r"(?<!\w)" + re.escape(p) + r"(?!\w)", p) for p in items]
+
+
+LEXICAL_RULES = {
+    key: [(re.compile(p, re.I), label) for p, label in pats]
+    for key, pats in {
+        "contra": CONTRASTIVE,
+        "blockw": [(r"\b" + re.escape(w) + r"\b", w) for w in BLOCKLIST] + VERB_ONLY,
+        "blockp": _phrases(BLOCK_PHRASES),
+        "intent": _phrases(INTENT_FRAMING),
+        "finance": _phrases(FINANCE_VAGUE),
+        "reader": _phrases(READER_CMDS),
+        "residue": _phrases(ASSISTANT_RESIDUE),
+    }.items()
+}
+
+# ---------------------------------------------------------------------------
+# Cleaning. Everything here keeps string length and line count unchanged, so
+# a match offset in the cleaned text still points at the right source line.
+# ---------------------------------------------------------------------------
+_WORD = re.compile(r"[^\W_](?:[^\W_]|')*")
+_FENCE = re.compile(r"^\s{0,3}(```|~~~)")
+_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_TAG = re.compile(r"</?[A-Za-z][^>]*>")
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
+_LINK = re.compile(r"\[([^\]\n]*)\]\(([^)\n]*)\)")
+_URL = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]]*[^\s<>()\[\].,;:!?'\"]")
+_QUOTED = re.compile(r'"[^"]{1,80}"')
+_BOLD = re.compile(r"\*\*(?=\S)[^*\n]*?\S\*\*|__(?=\S)[^_\n]*?\S__")
+_HEADING = re.compile(r"^\s*#{1,6}(?=\s|$)")
+_LIST = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+_RULE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+_SENT_END = re.compile(r"(?<=[.!?])\s+")
+_TERMINAL = re.compile(r"[.!?:;][\"')\]]*$")
+
+# Headings, list items and table rows are each a unit of their own. Prose and
+# quote lines run together into paragraphs until a blank line.
+_STANDALONE = {"heading", "list", "table", "rule", "image", "link", "sources"}
+_LEXICAL_KINDS = {"prose", "heading", "list", "quote", "table"}
+
+
+def _spaces(m):
+    return re.sub(r"[^\n]", " ", m.group())
+
 
 def _norm(text):
-    return (text.replace("’", "'").replace("‘", "'")
-                .replace("“", '"').replace("”", '"'))
+    return (text.replace("\r\n", "\n").replace("\r", "\n")
+                .replace("’", "'").replace("‘", "'")
+                .replace("“", '"').replace("”", '"')
+                .replace(" ", " "))
 
 
-def strip_frontmatter(text):
-    if text.startswith("---"):
-        end = text.find("\n---", 3)
-        if end != -1:
-            return text[end + 4:]
-    return text
+def _mask_non_language(text):
+    """Blank out frontmatter, fenced code, HTML comments and tags."""
+    lines = text.split("\n")
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() in ("---", "..."):
+                lines[:i + 1] = [""] * (i + 1)
+                break
+    fence = None                      # an unclosed fence runs to the end
+    for i, line in enumerate(lines):
+        m = _FENCE.match(line)
+        if fence or m:
+            lines[i] = ""
+            if fence and m and m.group(1) == fence:
+                fence = None
+            elif not fence:
+                fence = m.group(1)
+    text = _COMMENT.sub(_spaces, "\n".join(lines))
+    return _TAG.sub(_spaces, text)
 
 
-def is_prose_line(line):
+def _line_kind(line):
     s = line.strip()
     if not s:
-        return False
-    if s.startswith(("#", ">", "|", "---", "***", "- ", "* ", "1.", "!")):
-        return False
-    if s.lower().startswith(("sources:", "*sources", "_sources", "(sources")):
-        return False
+        return "blank"
+    if _RULE.match(s):
+        return "rule"
+    if _HEADING.match(s):
+        return "heading"
+    if s.startswith(">"):
+        return "quote"
+    if s.startswith("|"):
+        return "table"
+    if _LIST.match(s):
+        return "list"
+    if s.startswith("!["):
+        return "image"
     if re.match(r"^\[[^\]]+\]\(", s):
+        return "link"
+    if s.lower().startswith(("sources:", "*sources", "_sources", "(sources")):
+        return "sources"
+    return "prose"
+
+
+def _clean_line(line, kind):
+    """Strip markup from one line without changing its length."""
+    if kind == "heading":
+        line = _HEADING.sub(_spaces, line, count=1)
+    elif kind == "quote":
+        line = re.sub(r"^[\s>]+", _spaces, line)
+    elif kind == "list":
+        line = _LIST.sub(_spaces, line, count=1)
+    elif kind == "table":
+        line = line.replace("|", " ")
+    line = _INLINE_CODE.sub(_spaces, line)
+    line = _LINK.sub(lambda m: " " + m.group(1) + " " * (len(m.group(2)) + 3), line)
+    line = _URL.sub(_spaces, line)
+    return re.sub(r"[*_]", " ", line)
+
+
+def _blocks(lines):
+    """Yield (kind, [(lineno, masked_line, clean_line), ...]) paragraphs."""
+    block, current = [], None
+    for lineno, line in enumerate(lines, 1):
+        kind = _line_kind(line)
+        if kind == "blank" or kind != current or kind in _STANDALONE:
+            if block:
+                yield current, block
+            block, current = [], kind
+        if kind != "blank":
+            block.append((lineno, line, _clean_line(line, kind)))
+    if block:
+        yield current, block
+
+
+def _join(block):
+    """One string per paragraph, plus where each source line starts in it."""
+    starts, pos = [], 0
+    for _, _, clean in block:
+        starts.append(pos)
+        pos += len(clean) + 1
+    return " ".join(clean for _, _, clean in block), starts
+
+
+def _is_participle_opener(words):
+    first = words[0].lower()
+    if not (first.endswith("ing") and len(first) >= 5 and first not in ING_STOP):
         return False
-    return True
-
-
-def clean_inline(s):
-    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
-    s = re.sub(r"[*_`]", "", s)
-    return s
-
-
-def split_sentences(prose):
-    parts = re.split(r"(?<=[.!?])\s+", prose)
-    out = []
-    for p in parts:
-        words = re.findall(r"[A-Za-z0-9']+", p)
-        if len(words) >= 2:
-            out.append(words)
-    return out
+    return len(words) > 1 and words[1].lower() in DETERMINERS
 
 
 def analyze_text(raw):
     """Compute the raw metric dict from a text string."""
-    raw = raw or ""
-    body = strip_frontmatter(_norm(raw))
-    body = re.sub(r"```.*?```", "", body, flags=re.S)
+    source_lines = _norm(raw or "").split("\n")
+    lines = _mask_non_language("\n".join(source_lines)).split("\n")
+    blocks = list(_blocks(lines))
 
-    lines = body.splitlines()
-    prose_lines = [clean_inline(l) for l in lines if is_prose_line(l)]
-    prose = " ".join(prose_lines)
+    # ---- lexical view -----------------------------------------------------
+    hits = {key: [] for key in LEXICAL_RULES}
+    lexical_text = []
+    for kind, block in blocks:
+        if kind not in _LEXICAL_KINDS:
+            continue
+        text, starts = _join(block)
+        lexical_text.append(text)
+        text = _QUOTED.sub(_spaces, text)          # mentions, not uses
+        for key, rules in LEXICAL_RULES.items():
+            for rx, label in rules:
+                for m in rx.finditer(text):
+                    lineno = block[bisect.bisect_right(starts, m.start()) - 1][0]
+                    hits[key].append((lineno, label, source_lines[lineno - 1].strip()[:120]))
+    for found in hits.values():
+        found.sort(key=lambda h: h[0])
 
-    words = re.findall(r"[A-Za-z0-9']+", prose)
-    n_words = len(words)
-    per1k = (lambda c: round(c * 1000 / n_words, 1) if n_words else 0)
+    lexical = " ".join(lexical_text)
+    n_words = len(_WORD.findall(lexical))
+    letters = [c for c in lexical if c.isalpha()]
+    latin = sum(1 for c in letters if c <= "ɏ")
+    unsupported_script = (len(letters) - latin) >= 20 and latin < len(letters) - latin
 
-    emdash = sum(l.count("—") for l in lines if is_prose_line(l))
-    bold = body.count("**") // 2
+    # ---- rhythm view -------------------------------------------------------
+    sents, emdash, bold, n_prose_words = [], 0, 0, 0
+    paragraphs = fragments = 0
+    for kind, block in blocks:
+        if kind != "prose":
+            continue
+        text, _ = _join(block)
+        paragraphs += 1
+        fragments += not _TERMINAL.search(text.rstrip())
+        emdash += text.count("—")
+        bold += sum(len(_BOLD.findall(masked)) for _, masked, _ in block)
+        n_prose_words += len(_WORD.findall(text))
+        for part in _SENT_END.split(text):
+            words = _WORD.findall(part)
+            if len(words) >= 2:
+                sents.append(words)
+    fragmentary = paragraphs >= 4 and fragments * 2 >= paragraphs
 
-    sents = split_sentences(prose)
+    per1k = (lambda c: round(c * 1000 / max(n_prose_words, RATE_FLOOR_WORDS), 1)
+             if n_prose_words else 0)
     lens = [len(w) for w in sents]
     if len(lens) >= 2:
         mean = statistics.mean(lens)
@@ -154,50 +329,48 @@ def analyze_text(raw):
             longest_run = max(longest_run, run)
         else:
             run = 1
+    participle = sum(1 for w in sents if _is_participle_opener(w))
+    part_pct = round(participle * 100 / max(len(sents), RATE_FLOOR_SENTENCES), 1) if sents else 0
 
-    participle = 0
-    for w in sents:
-        first = w[0].lower()
-        if first.endswith("ing") and len(first) >= 5 and first not in ING_STOP:
-            participle += 1
-    part_pct = round(participle * 100 / len(sents), 1) if sents else 0
+    rhythm_ok = not fragmentary
+    variance_ok = rhythm_ok and len(lens) >= RATE_FLOOR_SENTENCES
 
-    def find(patterns, is_regex=False):
-        hits = []
-        for i, l in enumerate(raw.splitlines(), 1):
-            ll = _norm(l).lower()
-            for pat in patterns:
-                if is_regex:
-                    if re.search(pat[0], ll):
-                        hits.append((i, pat[1], l.strip()[:120]))
-                else:
-                    if pat in ll:
-                        hits.append((i, pat, l.strip()[:120]))
-        return hits
-
-    contra_hits = find(CONTRASTIVE, is_regex=True)
-    block_word_hits = find([(r"\b" + re.escape(w) + r"\b", w) for w in BLOCKLIST], True)
-    block_phrase_hits = find(BLOCK_PHRASES)
-    intent_hits = find(INTENT_FRAMING)
-    finance_hits = find(FINANCE_VAGUE)
-    reader_hits = find(READER_CMDS)
-    residue_hits = find(ASSISTANT_RESIDUE)
-
-    title = next((l for l in lines if l.strip().startswith("# ")), "")
+    title = next((l for l in lines if re.match(r"^\s*#\s", l)), "")
     title_colon = bool(re.search(r":", title)) and bool(
         re.search(r"(guide|everything you need|explained|mastering|demystifying|ultimate|complete)",
                   title.lower()))
 
+    notes = []
+    if not n_words:
+        notes.append("No readable text found. A scanned PDF (pages saved as images) "
+                     "has no text layer to read.")
+    elif unsupported_script:
+        notes.append("Most of this text is outside the Latin alphabet. The word "
+                      "lists and sentence rules only cover English, so it was not scored.")
+    else:
+        if n_prose_words < RATE_FLOOR_WORDS:
+            notes.append(f"Short text ({n_prose_words} words of running prose). Rates are "
+                         f"measured over at least {RATE_FLOOR_WORDS} words, so a single "
+                         "em-dash or bold phrase can't decide the verdict.")
+        if fragmentary:
+            notes.append("Most paragraphs are fragments (slides, forms, lists), so "
+                         "sentence-rhythm rules were not scored.")
+        elif not variance_ok:
+            notes.append(f"Only {len(lens)} sentences. Sentence-length variance needs "
+                         f"{RATE_FLOOR_SENTENCES} and was not scored.")
+
     return dict(
-        n_words=n_words, n_sentences=len(lens),
+        n_words=n_words, n_prose_words=n_prose_words, n_sentences=len(lens),
         emdash=emdash, emdash_per1k=per1k(emdash),
         bold=bold, bold_per1k=per1k(bold),
         mean_len=round(mean, 1), sd_len=round(sd, 1), cv=cv,
         longest_run=longest_run, participle=participle, part_pct=part_pct,
-        contra=contra_hits, blockw=block_word_hits, blockp=block_phrase_hits,
-        intent=intent_hits, finance=finance_hits,
-        reader=reader_hits, residue=residue_hits,
+        contra=hits["contra"], blockw=hits["blockw"], blockp=hits["blockp"],
+        intent=hits["intent"], finance=hits["finance"],
+        reader=hits["reader"], residue=hits["residue"],
         title_colon=title_colon, title=title.strip(),
+        rhythm_ok=rhythm_ok, variance_ok=variance_ok, fragmentary=fragmentary,
+        unsupported_script=unsupported_script, notes=notes,
     )
 
 
@@ -210,6 +383,7 @@ def _status(value, warn, bad):
 
 
 def _rows(m):
+    rhythm = (lambda s: s if m['rhythm_ok'] else "n/a")
     cv_status = "FLAG" if (m['cv'] and m['cv'] < 0.4) else ("warn" if m['cv'] and m['cv'] < 0.5 else "ok")
     return [
         ("Em-dashes", f"{m['emdash']} ({m['emdash_per1k']}/1k)",
@@ -217,13 +391,13 @@ def _rows(m):
         ("Contrastive / False Reframe", f"{len(m['contra'])} hits",
          _status(len(m['contra']), 2, 4), "'not X it's Y' family; ≤1"),
         ("Sentence variance", f"mean {m['mean_len']}w, CV {m['cv']}",
-         cv_status, "CV<0.4 = too uniform; human ~0.5–0.8"),
+         cv_status if m['variance_ok'] else "n/a", "CV<0.4 = too uniform; human ~0.5–0.8"),
         ("Monotony run", f"{m['longest_run']} sentences",
-         _status(m['longest_run'], 4, 6), "consecutive sentences within 3 words"),
+         rhythm(_status(m['longest_run'], 4, 6)), "consecutive sentences within 3 words"),
         ("-ing openers", f"{m['participle']} ({m['part_pct']}%)",
-         _status(m['part_pct'], 6, 10), "participle openers; human ~2–3%"),
+         rhythm(_status(m['part_pct'], 6, 10)), "'Leveraging the…' openers; human ~2–3%"),
         ("Bold emphasis", f"{m['bold']} ({m['bold_per1k']}/1k)",
-         _status(m['bold_per1k'], 5, 10), "bolded punch-lines; use sparingly"),
+         _status(m['bold_per1k'], 5, 10), "bolded punch-lines in prose; use sparingly"),
         ("Blocklist words", f"{len(m['blockw'])} hits",
          _status(len(m['blockw']), 2, 4), "delve / robust / tapestry / etc."),
         ("Blocklist phrases", f"{len(m['blockp'])} hits",
@@ -241,20 +415,24 @@ def _rows(m):
     ]
 
 
-def _slop_index(m):
-    pts = 0
-    pts += max(0, m['emdash_per1k'] - 5) * 1.2
-    pts += len(m['contra']) * 4
-    pts += (12 if (m['cv'] and m['cv'] < 0.4) else 0)
-    pts += max(0, m['longest_run'] - 3) * 3
-    pts += max(0, m['part_pct'] - 6) * 2
-    pts += max(0, m['bold_per1k'] - 5) * 1.0
-    pts += len(m['blockw']) * 3 + len(m['blockp']) * 4
-    pts += len(m['intent']) * 6 + len(m['finance']) * 6
-    pts += len(m['reader']) * 3
-    pts += len(m['residue']) * 25
-    pts += (15 if m['title_colon'] else 0)
-    return round(pts)
+def contributions(m):
+    """Points each rule adds to the SLOP INDEX. Unscored rules are absent."""
+    c = {"Em-dashes": min(STAT_CAP, max(0, m['emdash_per1k'] - 5) * 1.2),
+         "Contrastive / False Reframe": len(m['contra']) * 4}
+    if m['variance_ok']:
+        c["Sentence variance"] = 12 if (m['cv'] and m['cv'] < 0.4) else 0
+    if m['rhythm_ok']:
+        c["Monotony run"] = min(STAT_CAP, max(0, m['longest_run'] - 3) * 3)
+        c["-ing openers"] = min(STAT_CAP, max(0, m['part_pct'] - 6) * 2)
+    c["Bold emphasis"] = min(STAT_CAP, max(0, m['bold_per1k'] - 5) * 1.0)
+    c["Blocklist words"] = len(m['blockw']) * 3
+    c["Blocklist phrases"] = len(m['blockp']) * 4
+    c["Intent framing"] = len(m['intent']) * 6
+    c["Finance vagueness"] = len(m['finance']) * 6
+    c["Reader commands"] = len(m['reader']) * 3
+    c["Assistant residue"] = len(m['residue']) * 25
+    c["Title colon-formula"] = 15 if m['title_colon'] else 0
+    return c
 
 
 def _verdict(slop):
@@ -281,17 +459,28 @@ HIT_GROUPS = [
 def score_text(text):
     """Full structured result for one text."""
     m = analyze_text(text)
-    slop = _slop_index(m)
-    label, tier = _verdict(slop)
-    rows = [{"metric": r[0], "value": r[1], "status": r[2], "note": r[3]} for r in _rows(m)]
-    hits = {title: m[key] for title, key in HIT_GROUPS if m[key]}
+    scored = bool(m["n_words"]) and not m["unsupported_script"]
+    rows = [{"metric": r[0], "value": r[1], "status": r[2] if scored else "n/a", "note": r[3]}
+            for r in _rows(m)]
+    if scored:
+        points = contributions(m)
+        slop = round(sum(points.values()))
+        label, tier = _verdict(slop)
+    else:
+        points, slop, tier = {}, None, "unscored"
+        label = ("NOT SCORED — non-Latin script" if m["unsupported_script"]
+                 else "NOT SCORED — no readable text")
     return {
+        "scored": scored,
         "slop_index": slop,
         "verdict": label,
         "tier": tier,
         "n_words": m["n_words"],
+        "n_prose_words": m["n_prose_words"],
         "n_sentences": m["n_sentences"],
+        "notes": m["notes"],
         "rows": rows,
-        "hits": hits,
+        "hits": {title: m[key] for title, key in HIT_GROUPS if m[key]},
+        "contributions": {k: round(v, 1) for k, v in points.items() if v},
         "metrics": m,
     }

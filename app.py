@@ -23,8 +23,9 @@ TIER_COLOR = {
     "minor": "#b8860b",
     "reads_ai": "#d2691e",
     "heavy": "#b22222",
+    "unscored": "#6b7280",
 }
-STATUS_BADGE = {"ok": "🟢 ok", "warn": "🟡 warn", "FLAG": "🔴 FLAG"}
+STATUS_BADGE = {"ok": "🟢 ok", "warn": "🟡 warn", "FLAG": "🔴 FLAG", "n/a": "⚪ n/a"}
 
 # ----------------------------------------------------------------------------
 # Header
@@ -82,12 +83,13 @@ result = score_text(text)
 # ----------------------------------------------------------------------------
 with right:
     color = TIER_COLOR[result["tier"]]
+    index = result["slop_index"] if result["scored"] else "—"
     st.markdown(
         f"""
         <div style="border:1px solid #d9d9d9;border-radius:10px;padding:18px 20px;
                     border-left:8px solid {color};background:#fafafa;">
           <div style="font-size:13px;color:#666;letter-spacing:.5px;">SLOP INDEX (lower is better)</div>
-          <div style="font-size:54px;font-weight:700;line-height:1.05;color:{color};">{result['slop_index']}</div>
+          <div style="font-size:54px;font-weight:700;line-height:1.05;color:{color};">{index}</div>
           <div style="font-size:20px;font-weight:600;color:{color};">{result['verdict']}</div>
           <div style="font-size:12px;color:#888;margin-top:6px;">
             {result['n_words']} words · {result['n_sentences']} sentences
@@ -97,6 +99,8 @@ with right:
         unsafe_allow_html=True,
     )
     st.caption("Tiers: <15 CLEAN · 15–39 MINOR TELLS · 40–79 READS AI · 80+ HEAVY SLOP")
+    for note in result["notes"]:
+        st.caption(f"ⓘ {note}")
 
 # ----------------------------------------------------------------------------
 # Per-rule breakdown
@@ -120,7 +124,7 @@ if result["hits"]:
                 st.markdown(f"**L{ln}** · `{what}` — {txt}")
             if len(hits) > 40:
                 st.caption(f"… +{len(hits) - 40} more")
-else:
+elif result["scored"]:
     st.success("No flagged spans — the prose reads clean against all 13 rules.")
 
 st.divider()
